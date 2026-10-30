@@ -1,0 +1,7 @@
+streamlit
+openai
+PyMuPDF
+pandas
+matplotlib
+requests
+langchain-text-splitters

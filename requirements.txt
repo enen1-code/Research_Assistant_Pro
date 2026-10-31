@@ -1,9 +1,9 @@
 streamlit
 openai
+httpx
 PyMuPDF
 pandas
 matplotlib
 requests
 langchain-text-splitters
 streamlit-pdf-viewer
-pymupdf

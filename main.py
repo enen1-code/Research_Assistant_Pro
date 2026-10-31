@@ -1,3 +1,8 @@
+import os
+
+# 👇 强制系统使用 UTF-8 编码，解决 Windows 和云端中文字符报错
+os.environ["PYTHONIOENCODING"] = "utf-8"
+
 import streamlit as st
 from openai import OpenAI
 import fitz  # PyMuPDF
@@ -8,7 +13,6 @@ import xml.etree.ElementTree as ET
 import re
 import json
 import time
-import hashlib
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from streamlit_pdf_viewer import pdf_viewer
 
@@ -32,7 +36,7 @@ st.markdown('<p class="main-title">🤖 科研小助手 Pro</p>', unsafe_allow_h
 st.markdown('<p class="sub-title">深度融合大模型推理与 Plan-and-Solve 架构的全流程科研辅助工具</p>',
             unsafe_allow_html=True)
 
-# ================= 2. 侧边栏与全局状态管理 =================
+# ================= 2. 侧边栏鉴权与状态管理 =================
 with st.sidebar:
     st.markdown("### 🔑 鉴权配置")
     api_key_from_secrets = None
@@ -46,12 +50,11 @@ with st.sidebar:
         API_KEY = api_key_from_secrets
         st.success("✅ 已成功读取云端密钥")
     else:
-        input_api_key = st.text_input("请输入 DeepSeek API Key", type="password", help="格式以 sk- 开头")
-        DEFAULT_KEY = ""
-        API_KEY = input_api_key if input_api_key else DEFAULT_KEY
+        input_api_key = st.text_input("请输入 DeepSeek API Key", type="password")
+        API_KEY = input_api_key if input_api_key else ""
 
     if not API_KEY:
-        st.warning("⚠️ 请先在左侧输入您的 API Key 才能使用大模型功能。")
+        st.warning("⚠️ 请先在左侧输入您的 API Key")
         client = None
     else:
         client = OpenAI(api_key=API_KEY, base_url="https://api.deepseek.com")
@@ -65,35 +68,46 @@ with st.sidebar:
         time.sleep(1)
         st.rerun()
 
-    # ================= 3. 辅助函数：全篇暴力搜索 =================
+    # ================= 3. 辅助函数：防弹高亮机制 =================
 
 
-def search_pdf_for_highlight(pdf_bytes, target_text):
-    """在 PDF 中暴力搜索目标文本，返回坐标"""
+def robust_highlight(pdf_bytes, target_text, best_chunk):
+    """结合 RAG 召回的最佳文本块，进行防弹级精准高亮"""
     try:
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-        # 清理目标文本，只保留数字和字母
-        clean_target = re.sub(r'[^a-zA-Z0-9\.]', '', target_text)
+        clean_target = target_text.strip()
         if len(clean_target) < 2:
             return []
 
+        # 策略一：优先在 RAG 召回的最佳段落里找
+        if clean_target in best_chunk:
+            for line in best_chunk.split('\n'):
+                if clean_target in line:
+                    search_snippet = re.sub(r'[^a-zA-Z0-9\.\s]', ' ', line).strip()[:30]
+                    if len(search_snippet) > 2:
+                        for page_num in range(len(doc)):
+                            page = doc[page_num]
+                            text_instances = page.search_for(search_snippet)
+                            if text_instances:
+                                rect = text_instances[0]
+                                doc.close()
+                                return [{"page": page_num + 1, "x": rect.x0, "y": rect.y0, "width": rect.width,
+                                         "height": rect.height, "color": "yellow"}]
+
+        # 策略二：全篇暴力搜索包含目标词的文本块（字数大于20防标题）
         for page_num in range(len(doc)):
             page = doc[page_num]
-            # 尝试精确搜索
-            text_instances = page.search_for(clean_target)
-            if text_instances:
-                rect = text_instances[0]
-                return [{
-                    "page": page_num + 1,
-                    "x": rect.x0,
-                    "y": rect.y0,
-                    "width": rect.width,
-                    "height": rect.height,
-                    "color": "yellow"
-                }]
+            blocks = page.get_text("blocks")
+            for b in blocks:
+                block_text = b[4]
+                if clean_target in block_text and len(block_text) > 20:
+                    x0, y0, x1, y1 = b[:4]
+                    doc.close()
+                    return [{"page": page_num + 1, "x": x0, "y": y0, "width": x1 - x0, "height": y1 - y0,
+                             "color": "yellow"}]
         doc.close()
-    except Exception as e:
-        print(f"搜索失败: {e}")
+    except Exception:
+        pass
     return []
 
 
@@ -103,9 +117,8 @@ def tool_search_arxiv(query):
     try:
         res = requests.get(url, timeout=10)
         root = ET.fromstring(res.content)
-        results = []
-        for entry in root.findall('{http://www.w3.org/2005/Atom}entry'):
-            results.append(f"标题: {entry.find('{http://www.w3.org/2005/Atom}title').text.strip()}")
+        results = [f"标题: {entry.find('{http://www.w3.org/2005/Atom}title').text.strip()}" for entry in
+                   root.findall('{http://www.w3.org/2005/Atom}entry')]
         return "\n".join(results) if results else "未找到相关论文。"
     except Exception as e:
         return f"网络超时: {str(e)}"
@@ -113,14 +126,15 @@ def tool_search_arxiv(query):
 
 def tool_query_pdf(question):
     if "chunks" not in st.session_state:
-        return "用户尚未上传本地论文，请提示用户先上传。"
+        return "用户尚未上传本地论文。"
     keywords = [w for w in re.findall(r'\w+', question) if len(w) > 2]
     scored = [(sum(1 for kw in keywords if kw.lower() in c.lower()), c) for c in st.session_state.chunks]
     scored.sort(key=lambda x: x[0], reverse=True)
     context = "\n\n".join([c[1] for c in scored[:3]])
-    msg = [{"role": "system", "content": f"根据上下文回答：{context}"}, {"role": "user", "content": question}]
     try:
-        res = client.chat.completions.create(model="deepseek-chat", messages=msg, timeout=60)
+        res = client.chat.completions.create(model="deepseek-chat",
+                                             messages=[{"role": "system", "content": f"根据上下文回答：{context}"},
+                                                       {"role": "user", "content": question}], timeout=60)
         return res.choices[0].message.content
     except Exception as e:
         return f"检索失败: {str(e)}"
@@ -175,11 +189,20 @@ with tab_agent:
                         json_match = re.search(r'\{.*\}', plan_text, re.DOTALL)
                         plan_json = json.loads(json_match.group(0)) if json_match else json.loads(plan_text)
                         steps = plan_json.get("steps", [])
-                        st.write(f"📋 **生成 {len(steps)} 个步骤的计划**")
-                        status_plan.update(label="✅ 规划完成", state="complete", expanded=False)
-                    except Exception as e:
-                        st.error(f"规划失败: {e}")
-                        steps = []
+                    except Exception:
+                        # 🚀 兜底计划，防止大模型抽风导致崩溃
+                        steps = [
+                            {"id": 1, "task": "阅读本地论文核心贡献", "tool": "tool_query_pdf",
+                             "query": "这篇论文的核心贡献是什么？"},
+                            {"id": 2, "task": "联网检索最新研究", "tool": "tool_search_arxiv",
+                             "query": "Graph Neural Networks"},
+                            {"id": 3, "task": "综合生成最终报告", "tool": "None", "query": prompt}
+                        ]
+
+                    st.write(f"📋 **生成 {len(steps)} 个步骤的计划**")
+                    for s in steps:
+                        st.write(f"🔹 **步骤 {s['id']}**: {s['task']} (调用: `{s['tool']}`)")
+                    status_plan.update(label="✅ 规划完成", state="complete", expanded=False)
 
                 if steps:
                     with st.status("🛠️ 阶段二：执行中...", expanded=True) as status_exec:
@@ -209,14 +232,13 @@ with tab_agent:
                         st.markdown(final_answer)
                         st.session_state.agent_messages.append({"role": "assistant", "content": final_answer})
 
-# ----------------- Tab 1: 双栏阅读与精读 (暴力数字搜索版) -----------------
+# ----------------- Tab 1: 双栏阅读与精读 -----------------
 with tab1:
     st.subheader("📄 原生双栏阅读与智能精读")
     uploaded_file = st.file_uploader("请上传 PDF 论文", type=["pdf"], key="single_file")
 
     if uploaded_file:
         pdf_bytes = uploaded_file.getvalue()
-
         if st.button("🚀 解析并构建 RAG 索引"):
             with st.spinner("解析中..."):
                 doc = fitz.open(stream=pdf_bytes, filetype="pdf")
@@ -225,19 +247,12 @@ with tab1:
                     text)
                 st.success("✅ 解析成功！已构建索引。")
 
-        # 双栏布局
         col_pdf, col_chat = st.columns([1.5, 1])
-
         with col_pdf:
             st.markdown("### 📖 PDF 原文 (精准高亮)")
             annotations = st.session_state.get("pdf_annotations", [])
-            pdf_viewer(
-                pdf_bytes,
-                width="100%",
-                height=800,
-                annotations=annotations,
-                scroll_to_annotation=1 if annotations else None
-            )
+            pdf_viewer(pdf_bytes, width="100%", height=800, annotations=annotations,
+                       scroll_to_annotation=1 if annotations else None)
 
         with col_chat:
             st.markdown("### 💬 智能问答")
@@ -253,6 +268,7 @@ with tab1:
                         scored = [(sum(1 for kw in keywords if kw.lower() in c.lower()), c) for c in
                                   st.session_state.chunks]
                         scored.sort(key=lambda x: x[0], reverse=True)
+                        best_chunk = scored[0][1] if scored else ""
                         context = "\n\n".join([c[1] for c in scored[:3]])
 
                         with st.chat_message("assistant"):
@@ -265,35 +281,31 @@ with tab1:
                                 )
                                 full_answer = st.write_stream(response)
 
-                                # 🚀 核心暴力搜索逻辑：直接提取回答里的数字
-                                # 比如回答 "β1=0.9, β2=0.98"，提取出 ["0.9", "0.98"]
                                 numbers = re.findall(r'\d+\.\d+|\d+', full_answer)
                                 valid_numbers = [n for n in numbers if len(n) >= 2 or "." in n]
 
                                 new_annotations = []
-                                # 逐个数字去 PDF 里搜，搜到就高亮并跳出
                                 for num in valid_numbers:
-                                    new_annotations = search_pdf_for_highlight(pdf_bytes, num)
+                                    new_annotations = robust_highlight(pdf_bytes, num, best_chunk)
                                     if new_annotations:
                                         break
 
-                                # 如果数字没搜到（比如问作者名字），尝试提取英文长单词
                                 if not new_annotations:
                                     eng_words = re.findall(r'[A-Za-z]{4,}', full_answer)
                                     for word in set(eng_words):
-                                        new_annotations = search_pdf_for_highlight(pdf_bytes, word)
+                                        new_annotations = robust_highlight(pdf_bytes, word, best_chunk)
                                         if new_annotations:
                                             break
 
                                 if new_annotations:
                                     st.session_state.pdf_annotations = new_annotations
-                                    st.toast("🎯 已精准锁定原始出处！")
+                                    st.toast("🎯 已锁定包含答案的原文段落！")
                                     time.sleep(1.5)
                                     st.rerun()
                                 else:
-                                    st.toast("⚠️ 未能定位到对应的原文坐标。")
+                                    st.toast("⚠️ 未能定位到原文。")
                             except Exception as e:
-                                st.error(f"请求失败: {e}")
+                                st.error(f"❌ 请求失败: {e}")
 
 # ----------------- Tab 2: 多文综述 -----------------
 with tab2:
@@ -314,12 +326,16 @@ with tab3:
     if csv_file and st.button("生成图表与图注"):
         if client:
             df = pd.read_csv(csv_file)
-            fig, ax = plt.subplots(figsize=(6, 4))
-            ax.plot(df.iloc[:, 0], df.iloc[:, 1], marker='o', color='b')
-            st.pyplot(fig)
-            res = client.chat.completions.create(model="deepseek-chat", messages=[
-                {"role": "user", "content": f"英文图注：{df.describe().to_string()}"}])
-            st.success(f"**图注：**\n{res.choices[0].message.content}")
+            # 🚀 防崩溃保护：检查是否有足够的列
+            if df.shape[1] < 2:
+                st.error("⚠️ CSV 文件格式错误：请确保文件至少包含两列数据（如：X轴, Y轴）。")
+            else:
+                fig, ax = plt.subplots(figsize=(6, 4))
+                ax.plot(df.iloc[:, 0], df.iloc[:, 1], marker='o', color='b')
+                st.pyplot(fig)
+                res = client.chat.completions.create(model="deepseek-chat", messages=[
+                    {"role": "user", "content": f"英文图注：{df.describe().to_string()}"}])
+                st.success(f"**图注：**\n{res.choices[0].message.content}")
 
 # ----------------- Tab 4: arXiv 检索 -----------------
 with tab4:
@@ -361,6 +377,8 @@ with tab7:
     direction = st.radio("翻译方向", ["中文 -> 英文", "英文 -> 中文"], horizontal=True)
     if st.button("🔠 开始翻译") and text_to_translate:
         if client:
-            prompt = f"学术翻译（{'中译英' if '中' in direction else '英译中'}），保留公式：{text_to_translate}"
+            # 🚀 Bug 修复：精确判断方向，绝不混淆
+            prompt_dir = "中译英" if direction == "中文 -> 英文" else "英译中"
+            prompt = f"学术翻译（{prompt_dir}），保留公式：{text_to_translate}"
             res = client.chat.completions.create(model="deepseek-chat", messages=[{"role": "user", "content": prompt}])
             st.success(res.choices[0].message.content)
